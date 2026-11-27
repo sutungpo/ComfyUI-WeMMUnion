@@ -162,7 +162,7 @@ def _ensure_loaded(spec: tuple[str, bool, str]) -> tuple[object, object]:
                 )
             else:
                 device_map = "auto" if torch.cuda.is_available() else None
-
+        logger.info(f"[WeMM] Device map: {device_map}")
         load_kwargs: dict = {
             "trust_remote_code": True,
             "local_files_only": local_only,
