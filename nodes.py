@@ -4,11 +4,19 @@ import base64
 import io as stdlib_io
 import json
 import os
-
-from accelerate import infer_auto_device_map, init_empty_weights
+import re
+import torch
+import shutil
+import folder_paths
+import subprocess
+import sys
+import time
+import itertools
 import numpy as np
 from PIL import Image
-import torch
+import urllib.parse
+
+from accelerate import infer_auto_device_map, init_empty_weights
 from transformers import (
     AutoConfig,
     AutoModelForImageTextToText,
@@ -18,8 +26,8 @@ from transformers import (
 
 import comfy.model_management
 from comfy_api.latest import Input, Types, io
-import folder_paths
-
+import logging
+logger = logging.getLogger(__name__)
 
 WEMM_MODEL = io.Custom("WEMM_VIDEO_MODEL")
 
@@ -293,3 +301,361 @@ class WeMMVideoInference(io.ComfyNode):
             comfy.model_management.soft_empty_cache()
 
         return io.NodeOutput(answer)
+
+########################################################
+# ShellCommandNode
+########################################################
+class ShellCommandNode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ShellCommandRunner",
+            display_name="Shell Command Runner",
+            category="utils",
+            description="Execute shell commands on the host system and log output.",
+            is_output_node=True,
+            not_idempotent=True,
+            inputs=[
+                io.String.Input(
+                    "command",
+                    default="",
+                    multiline=True,
+                    tooltip="Shell command(s) to execute.",
+                ),
+                io.String.Input(
+                    "cwd",
+                    default="",
+                    multiline=False,
+                    optional=True,
+                    tooltip="Working directory (defaults to custom_nodes when empty).",
+                ),
+            ],
+            outputs=[],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs) -> int:
+        return time.monotonic_ns()
+
+    @classmethod
+    def execute(cls, command: str, cwd: str = "") -> io.NodeOutput:
+        cmd = (command or "").strip()
+        if not cmd:
+            raise ValueError("Command cannot be empty.")
+
+        work_dir = (cwd or "").strip() or folder_paths.get_folder_paths("custom_nodes")[0]
+        if not os.path.isdir(work_dir):
+            raise FileNotFoundError(f"Working directory does not exist: {work_dir}")
+
+        env = os.environ.copy()
+        py_bin = os.path.dirname(sys.executable)
+        env["PATH"] = f"{py_bin}{os.pathsep}{env.get('PATH', '')}"
+
+        logger.info("Executing command in %s: %s", work_dir, cmd)
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=work_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.stdout:
+            logger.info("[stdout]\n%s", result.stdout.rstrip())
+        if result.stderr:
+            logger.warning("[stderr]\n%s", result.stderr.rstrip())
+        logger.info("Command exited with code %d", result.returncode)
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Command failed (exit {result.returncode}): "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+
+        return io.NodeOutput()
+
+# =====================================================================
+# RestartSignal
+# =====================================================================
+class RestartSignal(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="RestartSignal",
+            category="utils",
+            is_output_node=True,
+            inputs=[],
+            outputs=[],
+        )
+
+    @classmethod
+    def execute(cls) -> io.NodeOutput:
+        flag = "/tmp/comfyui_restart.request"
+        with open(flag, "w") as f:
+            f.write("restart")
+
+        logger.warning("[RestartSignal] Restart requested.")
+        return io.NodeOutput()
+
+# =====================================================================
+# DataInspector log
+# =====================================================================
+"""Data Inspector: a pass-through node that logs details of whatever flows through it."""
+MAX_VALUE_ELEMS = 32  # larger values are not logged; also caps listed container items
+MAX_DEPTH = 2         # container levels expanded below the input
+
+_DEVICE_ATTRS = ("device", "load_device", "offload_device", "current_device")
+_WRAPPED_ATTRS = ("model", "patcher")  # one wrapper level, e.g. ModelPatcher.model, CLIP.patcher
+_SCALARS = (bool, int, float, complex, type(None))
+
+
+def _get(obj, name):
+    try:
+        return getattr(obj, name, None)
+    except Exception:
+        return None
+
+
+def _device_info(obj):
+    """Best-effort device details for objects that are not tensors or plain containers."""
+    info = []
+    targets = [("", obj)] + [(f"{n}.", _get(obj, n)) for n in _WRAPPED_ATTRS]
+    for prefix, target in targets:
+        if target is None:
+            continue
+        for attr in _DEVICE_ATTRS:
+            value = _get(target, attr)
+            if value is not None and not callable(value):
+                info.append(f"{prefix}{attr}={value}")
+        if isinstance(target, torch.nn.Module):
+            devices, params, size = set(), 0, 0
+            for p in target.parameters():
+                devices.add(str(p.device))
+                params += p.numel()
+                size += p.numel() * p.element_size()
+            info.append(f"{prefix}param_devices={sorted(devices)} params={params} param_bytes={size}")
+    return info
+
+
+def _inspect(obj):
+    """Return (one-line summary, [(child name, child), ...])."""
+    parts = [f"type={type(obj).__name__}"]
+    children = []
+    count = value = None  # count: number of elements; value: zero-arg callable
+
+    if isinstance(obj, torch.Tensor):
+        count = obj.numel()
+        parts += [f"shape={tuple(obj.shape)}", f"dtype={obj.dtype}", f"device={obj.device}",
+                  f"numel={count}", f"bytes={count * obj.element_size()}"]
+        value = lambda: obj.detach().cpu().tolist()
+    elif isinstance(obj, np.ndarray):
+        count = obj.size
+        parts += [f"shape={obj.shape}", f"dtype={obj.dtype}", f"numel={count}", f"bytes={obj.nbytes}"]
+        value = obj.tolist
+    elif isinstance(obj, (str, bytes)):
+        count = len(obj)
+        parts.append(f"len={count}")
+        value = lambda: obj
+    elif isinstance(obj, _SCALARS):
+        count, value = 1, lambda: obj
+    elif isinstance(obj, (dict, list, tuple)):
+        parts.append(f"len={len(obj)}")
+        if len(obj) > MAX_VALUE_ELEMS:
+            parts.append(f"showing_first={MAX_VALUE_ELEMS}")
+        items = obj.items() if isinstance(obj, dict) else enumerate(obj)
+        children = [(f"[{k!r}]", v) for k, v in itertools.islice(items, MAX_VALUE_ELEMS)]
+    else:
+        parts.append(f"sizeof={sys.getsizeof(obj)}")
+        parts += _device_info(obj)
+
+    if count is not None:
+        parts.append(f"value={value()!r}" if count <= MAX_VALUE_ELEMS
+                     else f"value=<omitted: {count} elements>")
+    return " ".join(parts), children
+
+
+def _describe(obj, name, depth=0):
+    pad = "  " * depth
+    try:
+        summary, children = _inspect(obj)
+    except Exception as exc:  # logging must never break the graph
+        summary, children = f"type={type(obj).__name__} <inspect failed: {exc!r}>", []
+    logger.info("[DataInspector] %s%s: %s", pad, name, summary)
+    if children and depth >= MAX_DEPTH:
+        logger.info("[DataInspector] %s  ...<max depth %d reached>", pad, MAX_DEPTH)
+        return
+    for child_name, child in children:
+        _describe(child, child_name, depth + 1)
+
+
+class DataInspector(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DataInspector",
+            category="utils",
+            is_output_node=True,
+            inputs=[io.AnyType.Input("data")],
+            outputs=[io.AnyType.Output(display_name="data")],
+        )
+
+    @classmethod
+    def execute(cls, data) -> io.NodeOutput:
+        _describe(data, "data")
+        return io.NodeOutput(data)
+
+
+# =====================================================================
+# Model Downloader
+# =====================================================================
+class ModelDownloaderNode(io.ComfyNode):
+    """
+    High-speed model downloader for ComfyUI leveraging aria2c.
+    Supports existing categories or creating new first-level directories in ComfyUI/models/.
+    """
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        # Query ComfyUI's registry and add [models_root] to allow 1st-level folder creation
+        registered_categories = sorted(list(folder_paths.folder_names_and_paths.keys()))
+        available_categories = ["[models_root]"] + registered_categories
+        default_category = "checkpoints" if "checkpoints" in registered_categories else "[models_root]"
+
+        return io.Schema(
+            node_id="ModelDownloaderNode",
+            category="utils",
+            is_output_node=True,
+            inputs=[
+                io.String.Input("url", default="", multiline=False),
+                io.Combo.Input("target_category", options=available_categories, default=default_category),
+                io.Boolean.Input("overwrite", default=False),
+                io.String.Input("subfolder", default="", multiline=False, optional=True),
+                io.String.Input("filename", default="", multiline=False, optional=True),
+                io.String.Input("auth_token", default="", multiline=False, optional=True),
+            ],
+            outputs=[],
+        )
+
+    @classmethod
+    def execute(cls, url: str, target_category: str, overwrite: bool, subfolder: str = "", filename: str = "", auth_token: str = "") -> io.NodeOutput:
+        url = url.strip()
+        if not url:
+            logger.info("[ModelDownloader] Empty URL provided. Skipping.")
+            return io.NodeOutput()
+
+        # 1. Platform Binary Verification
+        if not shutil.which("aria2c"):
+            raise RuntimeError(
+                "[ModelDownloader] 'aria2c' binary not found in system PATH. "
+                "Please install it in your cloud container (e.g., 'apt-get update && apt-get install -y aria2')."
+            )
+
+        # 2. Strict ComfyUI Path Resolution
+        if target_category == "[models_root]":
+            # Target ComfyUI/models/ directly
+            base_dir = os.path.abspath(folder_paths.models_dir)
+        else:
+            base_dirs = folder_paths.get_folder_paths(target_category)
+            if not base_dirs:
+                raise ValueError(f"[ModelDownloader] No paths registered for category '{target_category}'")
+            base_dir = os.path.abspath(base_dirs[0])
+
+        clean_subfolder = os.path.normpath(subfolder.strip()).lstrip("/\\")
+
+        if clean_subfolder in ("", "."):
+            target_dir = base_dir
+        else:
+            target_dir = os.path.abspath(os.path.join(base_dir, clean_subfolder))
+
+        # Enforce canonical path containment (prevent directory traversal)
+        if os.path.commonpath([base_dir, target_dir]) != base_dir:
+            raise ValueError(f"[ModelDownloader] Security violation: Destination '{target_dir}' escapes '{base_dir}'")
+
+        # Automatically create the first-level or nested subfolder
+        os.makedirs(target_dir, exist_ok=True)
+
+        # If a new first-level directory is created under models/, register it with ComfyUI
+        if target_category == "[models_root]" and clean_subfolder and hasattr(folder_paths, "add_model_folder_path"):
+            folder_paths.add_model_folder_path(clean_subfolder, target_dir)
+
+        # 3. Filename & Source URL Normalization
+        if "huggingface.co" in url:
+            url = url.replace("/blob/", "/resolve/")
+
+        # Incur filename: User Override -> URL Path Basename -> Fallback to Content-Disposition
+        target_filename = filename.strip()
+        if not target_filename:
+            parsed_path = urllib.parse.urlsplit(url).path.rstrip("/")
+            extracted_name = os.path.basename(parsed_path)
+            if extracted_name and "." in extracted_name:
+                target_filename = urllib.parse.unquote(extracted_name)
+
+        # Skip download if the final target file already exists
+        if target_filename:
+            destination_file = os.path.join(target_dir, target_filename)
+            if os.path.exists(destination_file) and not overwrite:
+                logger.info(f"[ModelDownloader] File already exists, skipping: {destination_file}")
+                if hasattr(folder_paths, "filename_list_cache"):
+                    folder_paths.filename_list_cache.clear()
+                return io.NodeOutput()
+
+        # 4. Assemble aria2c Command
+        cmd = [
+            "aria2c",
+            "--console-log-level=warn",
+            "--summary-interval=1",
+            "--content-disposition=true",
+            "-x", "16",
+            "-s", "16",
+            "-k", "1M",
+            "-c",
+            f"--dir={target_dir}",
+        ]
+
+        if target_filename:
+            cmd.append(f"--out={target_filename}")
+
+        if overwrite:
+            cmd.append("--allow-overwrite=true")
+        else:
+            cmd.append("--auto-file-renaming=false")
+
+        token = auth_token.strip()
+        if token:
+            cmd.append(f"--header=Authorization: Bearer {token}")
+
+        cmd.append(url)
+
+        # 5. Process Execution & Progress Reporting via Native ComfyUI Contract
+        logger.info(f"[ModelDownloader] Initiating transfer for: {url}")
+        pbar = comfy.utils.ProgressBar(100)
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        progress_regex = re.compile(r'\((\s*\d+)%\)')
+
+        for line in process.stdout:
+            match = progress_regex.search(line)
+            if match:
+                percent = int(match.group(1))
+                pbar.update_absolute(percent, 100)
+
+        process.wait()
+
+        if process.returncode != 0:
+            raise RuntimeError(f"[ModelDownloader] aria2c transfer failed with exit code {process.returncode}")
+
+        pbar.update_absolute(100, 100)
+
+        # 6. Invalidate ComfyUI Cache
+        if hasattr(folder_paths, "filename_list_cache"):
+            folder_paths.filename_list_cache.clear()
+
+        logger.info(f"[ModelDownloader] Download completed successfully to {target_dir}")
+        return io.NodeOutput()
