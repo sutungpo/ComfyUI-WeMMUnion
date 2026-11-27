@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+import base64
+import io as stdlib_io
 import json
 import os
-from pathlib import Path
-import tempfile
-from typing import Iterator
 
 from accelerate import infer_auto_device_map, init_empty_weights
 import numpy as np
@@ -30,6 +28,8 @@ _AWQ_MLP_TARGETS = [
     r"(?:(?:experts\.\d+|shared_expert)\.)?"
     r"(?:gate|up|down)_proj$"
 ]
+
+_DIRECT_DEVICE_MAPS = {"auto", "balanced", "balanced_low_0", "sequential"}
 
 
 def _resolve_model_source(model_id: str) -> str:
@@ -59,8 +59,7 @@ def _parse_max_memory(spec: str) -> dict[int | str, str] | None:
     return {i: spec for i in range(gpu_count)}
 
 
-@contextmanager
-def _resolve_video_path(video: Input.Video) -> Iterator[str]:
+def _video_to_data_uri(video: Input.Video) -> str:
     source = video.get_stream_source()
     trim_window = (
         video.get_active_trim_window()
@@ -73,20 +72,23 @@ def _resolve_video_path(video: Input.Video) -> Iterator[str]:
         else None
     )
 
-    if isinstance(source, str) and trim_window == (0.0, 0.0) and crop_rect is None:
-        yield source
-        return
-
-    temp_root = folder_paths.get_temp_directory()
-    os.makedirs(temp_root, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="wemm_video_", dir=temp_root) as tmpdir:
-        tmp_path = str(Path(tmpdir) / "input.mp4")
+    if (
+        isinstance(source, stdlib_io.BytesIO)
+        and trim_window == (0.0, 0.0)
+        and crop_rect is None
+    ):
+        raw_bytes = source.getvalue()
+    else:
+        buf = stdlib_io.BytesIO()
         video.save_to(
-            tmp_path,
+            buf,
             format=Types.VideoContainer.MP4,
             codec=Types.VideoCodec.AUTO,
         )
-        yield tmp_path
+        raw_bytes = buf.getvalue()
+
+    encoded = base64.b64encode(raw_bytes).decode("ascii")
+    return f"data:video/mp4;base64,{encoded}"
 
 
 class WeMMVideoModelLoader(io.ComfyNode):
@@ -95,8 +97,8 @@ class WeMMVideoModelLoader(io.ComfyNode):
         return io.Schema(
             node_id="WeMMVideoModelLoader",
             display_name="WeMM Video Model Loader",
-            category="video/WeMM",
-            description="Loads a WeMM-Video AWQ model and processor.",
+            category="WeMM",
+            description="Loads a WeMM-Video model and processor.",
             inputs=[
                 io.String.Input(
                     "model_id",
@@ -106,12 +108,7 @@ class WeMMVideoModelLoader(io.ComfyNode):
                 io.String.Input(
                     "max_memory",
                     default="13GiB",
-                    tooltip="Per-GPU budget (e.g. '13GiB'), comma-separated per GPU ('13GiB,13GiB'), or JSON dict.",
-                ),
-                io.Boolean.Input(
-                    "run_compressed",
-                    default=False,
-                    advanced=True,
+                    tooltip="Per-GPU budget ('13GiB', '13GiB,13GiB', JSON dict) or 'auto' / 'cuda:0'.",
                 ),
             ],
             outputs=[
@@ -124,52 +121,73 @@ class WeMMVideoModelLoader(io.ComfyNode):
         cls,
         model_id: str,
         max_memory: str,
-        run_compressed: bool,
     ) -> io.NodeOutput:
         model_source = _resolve_model_source(model_id)
         config = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
 
-        max_mem_map = _parse_max_memory(max_memory)
-        if max_mem_map is not None:
-            with init_empty_weights():
-                empty_model = AutoModelForImageTextToText.from_config(
-                    config,
-                    trust_remote_code=True,
-                    torch_dtype=torch.bfloat16,
-                )
-            no_split = getattr(empty_model, "_no_split_modules", None)
-            device_map = infer_auto_device_map(
-                empty_model,
-                max_memory=max_mem_map,
-                no_split_module_classes=no_split,
-                dtype=torch.bfloat16,
-                verbose=False,
-            )
+        spec = max_memory.strip()
+        if spec.lower() in _DIRECT_DEVICE_MAPS or spec.lower().startswith("cuda"):
+            device_map: str | dict | None = spec
         else:
-            device_map = "auto" if torch.cuda.is_available() else None
+            max_mem_map = _parse_max_memory(spec)
+            if max_mem_map is not None:
+                with init_empty_weights():
+                    empty_model = AutoModelForImageTextToText.from_config(
+                        config,
+                        trust_remote_code=True,
+                        torch_dtype=torch.bfloat16,
+                    )
+                no_split = getattr(empty_model, "_no_split_modules", None)
+                device_map = infer_auto_device_map(
+                    empty_model,
+                    max_memory=max_mem_map,
+                    no_split_module_classes=no_split,
+                    dtype=torch.bfloat16,
+                    verbose=False,
+                )
+            else:
+                device_map = "auto" if torch.cuda.is_available() else None
+
+        load_kwargs: dict = {
+            "trust_remote_code": True,
+            "dtype": torch.bfloat16,
+            "config": config,
+            "device_map": device_map,
+        }
 
         quant_cfg = getattr(config, "quantization_config", None)
-        if isinstance(quant_cfg, dict) and "config_groups" in quant_cfg:
-            for group in quant_cfg["config_groups"].values():
-                group["targets"] = _AWQ_MLP_TARGETS
+        quant_method = (
+            quant_cfg.get("quant_method")
+            if isinstance(quant_cfg, dict)
+            else getattr(quant_cfg, "quant_method", None)
+        )
+        if quant_method == "compressed-tensors":
+            if isinstance(quant_cfg, dict) and "config_groups" in quant_cfg:
+                for group in quant_cfg["config_groups"].values():
+                    group["targets"] = _AWQ_MLP_TARGETS
+            load_kwargs["quantization_config"] = CompressedTensorsConfig(
+                run_compressed=False
+            )
+
+        if device_map == "auto" or (
+            isinstance(device_map, dict) and "disk" in device_map.values()
+        ):
+            offload_dir = os.path.join(folder_paths.get_temp_directory(), "wemm_offload")
+            os.makedirs(offload_dir, exist_ok=True)
+            load_kwargs["offload_folder"] = offload_dir
 
         processor = AutoProcessor.from_pretrained(
             model_source,
             trust_remote_code=True,
         )
-
-        offload_dir = os.path.join(folder_paths.get_temp_directory(), "wemm_offload")
-        os.makedirs(offload_dir, exist_ok=True)
-
         model = AutoModelForImageTextToText.from_pretrained(
             model_source,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
-            config=config,
-            quantization_config=CompressedTensorsConfig(run_compressed=run_compressed),
-            device_map=device_map,
-            offload_folder=offload_dir,
+            **load_kwargs,
         ).eval()
+
+        for module in model.modules():
+            if hasattr(module, "_old_forward") and not hasattr(module, "_hf_hook"):
+                module.forward = module._old_forward
 
         return io.NodeOutput((model, processor))
 
@@ -180,7 +198,7 @@ class WeMMVideoInference(io.ComfyNode):
         return io.Schema(
             node_id="WeMMVideoInference",
             display_name="WeMM Video Inference",
-            category="video/WeMM",
+            category="WeMM",
             description="Runs WeMM-Video multimodal inference on video, images, and text.",
             inputs=[
                 WEMM_MODEL.Input("model"),
@@ -224,55 +242,54 @@ class WeMMVideoInference(io.ComfyNode):
         loaded_model, processor = model
         content: list[dict] = []
 
-        def _run_with_video(video_path: str | None) -> str:
-            if video_path is not None:
+        if video is not None:
+            content.append(
+                {
+                    "type": "video",
+                    "video": _video_to_data_uri(video),
+                    "fps": fps,
+                    "min_frames": min_frames,
+                    "max_frames": max_frames,
+                    "total_pixels": total_pixels,
+                }
+            )
+
+        if image is not None:
+            frames = (image.clamp(0.0, 1.0) * 255.0).to(torch.uint8).cpu().numpy()
+            for frame in frames:
                 content.append(
                     {
-                        "type": "video",
-                        "video": video_path,
-                        "fps": fps,
-                        "min_frames": min_frames,
-                        "max_frames": max_frames,
-                        "total_pixels": total_pixels,
+                        "type": "image",
+                        "image": Image.fromarray(np.ascontiguousarray(frame)),
                     }
                 )
 
-            if image is not None:
-                frames = (image.clamp(0.0, 1.0) * 255.0).to(torch.uint8).cpu().numpy()
-                for frame in frames:
-                    content.append(
-                        {
-                            "type": "image",
-                            "image": Image.fromarray(np.ascontiguousarray(frame)),
-                        }
-                    )
+        content.append({"type": "text", "text": prompt})
+        messages = [{"role": "user", "content": content}]
 
-            content.append({"type": "text", "text": prompt})
-            messages = [{"role": "user", "content": content}]
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        ).to(device=loaded_model.device, dtype=loaded_model.dtype)
 
-            inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-                add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            ).to(device=loaded_model.device, dtype=loaded_model.dtype)
+        del content, messages
 
+        output = None
+        try:
             with torch.inference_mode():
                 output = loaded_model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=do_sample,
                 )
-
             answer_ids = output[0, inputs.input_ids.shape[1] :]
-            return processor.tokenizer.decode(answer_ids, skip_special_tokens=True)
-
-        if video is not None:
-            with _resolve_video_path(video) as video_path:
-                answer = _run_with_video(video_path)
-        else:
-            answer = _run_with_video(None)
+            answer = processor.tokenizer.decode(answer_ids, skip_special_tokens=True)
+        finally:
+            del inputs, output
+            comfy.model_management.soft_empty_cache()
 
         return io.NodeOutput(answer)
