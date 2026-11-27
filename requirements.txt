@@ -1,0 +1,3 @@
+transformers
+accelerate
+compressed-tensors==0.13.0
