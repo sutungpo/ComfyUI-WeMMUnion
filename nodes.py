@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io as stdlib_io
 import json
+import gc
 import os
 import re
 import torch
@@ -29,6 +30,9 @@ from comfy_api.latest import Input, Types, io
 import logging
 logger = logging.getLogger(__name__)
 
+import threading
+from accelerate.hooks import remove_hook_from_module
+
 WEMM_MODEL = io.Custom("WEMM_VIDEO_MODEL")
 
 _AWQ_MLP_TARGETS = [
@@ -39,12 +43,35 @@ _AWQ_MLP_TARGETS = [
 
 _DIRECT_DEVICE_MAPS = {"auto", "balanced", "balanced_low_0", "sequential"}
 
+_SLOT_LOCK = threading.Lock()
+_ACTIVE_SLOT: dict[str, object] = {
+    "spec": None,
+    "model": None,
+    "processor": None,
+}
 
-def _resolve_model_source(model_id: str) -> str:
-    local_candidate = os.path.join(folder_paths.models_dir, "LLM", model_id)
-    if os.path.isdir(local_candidate):
-        return local_candidate
-    return model_id
+
+def _resolve_model_source(model_id: str, local_path: str) -> tuple[str, bool]:
+    raw_local = local_path.strip()
+    if raw_local:
+        expanded = os.path.expanduser(raw_local)
+        if os.path.isdir(expanded):
+            return os.path.abspath(expanded), True
+        llm_relative = os.path.join(folder_paths.models_dir, "LLM", expanded)
+        if os.path.isdir(llm_relative):
+            return os.path.abspath(llm_relative), True
+        raise FileNotFoundError(f"Local model directory not found: {expanded}")
+
+    raw_id = model_id.strip()
+    expanded_id = os.path.expanduser(raw_id)
+    if os.path.isdir(expanded_id):
+        return os.path.abspath(expanded_id), True
+
+    llm_candidate = os.path.join(folder_paths.models_dir, "LLM", raw_id)
+    if os.path.isdir(llm_candidate):
+        return os.path.abspath(llm_candidate), True
+
+    return raw_id, False
 
 
 def _parse_max_memory(spec: str) -> dict[int | str, str] | None:
@@ -65,6 +92,113 @@ def _parse_max_memory(spec: str) -> dict[int | str, str] | None:
         return {i: parts[i] for i in range(min(gpu_count, len(parts)))}
 
     return {i: spec for i in range(gpu_count)}
+
+
+def _unload_active_model() -> None:
+    old_model = _ACTIVE_SLOT["model"]
+    _ACTIVE_SLOT["spec"] = None
+    _ACTIVE_SLOT["model"] = None
+    _ACTIVE_SLOT["processor"] = None
+
+    if old_model is not None:
+        remove_hook_from_module(old_model, recurse=True)
+        del old_model
+
+    gc.collect()
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+
+
+def _ensure_loaded(spec: tuple[str, bool, str]) -> tuple[object, object]:
+    with _SLOT_LOCK:
+        if (
+            _ACTIVE_SLOT["spec"] == spec
+            and _ACTIVE_SLOT["model"] is not None
+            and _ACTIVE_SLOT["processor"] is not None
+        ):
+            return _ACTIVE_SLOT["model"], _ACTIVE_SLOT["processor"]
+
+        _unload_active_model()
+
+        model_source, local_only, max_memory_spec = spec
+        config = AutoConfig.from_pretrained(
+            model_source,
+            trust_remote_code=True,
+            local_files_only=local_only,
+        )
+
+        if (
+            max_memory_spec.lower() in _DIRECT_DEVICE_MAPS
+            or max_memory_spec.lower().startswith("cuda")
+        ):
+            device_map: str | dict | None = max_memory_spec
+        else:
+            max_mem_map = _parse_max_memory(max_memory_spec)
+            if max_mem_map is not None:
+                with init_empty_weights():
+                    empty_model = AutoModelForImageTextToText.from_config(
+                        config,
+                        trust_remote_code=True,
+                        torch_dtype=torch.bfloat16,
+                    )
+                no_split = getattr(empty_model, "_no_split_modules", None)
+                device_map = infer_auto_device_map(
+                    empty_model,
+                    max_memory=max_mem_map,
+                    no_split_module_classes=no_split,
+                    dtype=torch.bfloat16,
+                    verbose=False,
+                )
+            else:
+                device_map = "auto" if torch.cuda.is_available() else None
+
+        load_kwargs: dict = {
+            "trust_remote_code": True,
+            "local_files_only": local_only,
+            "dtype": torch.bfloat16,
+            "config": config,
+            "device_map": device_map,
+        }
+
+        quant_cfg = getattr(config, "quantization_config", None)
+        quant_method = (
+            quant_cfg.get("quant_method")
+            if isinstance(quant_cfg, dict)
+            else getattr(quant_cfg, "quant_method", None)
+        )
+        if quant_method == "compressed-tensors":
+            if isinstance(quant_cfg, dict) and "config_groups" in quant_cfg:
+                for group in quant_cfg["config_groups"].values():
+                    group["targets"] = _AWQ_MLP_TARGETS
+            load_kwargs["quantization_config"] = CompressedTensorsConfig(
+                run_compressed=False
+            )
+
+        if device_map == "auto" or (
+            isinstance(device_map, dict) and "disk" in device_map.values()
+        ):
+            offload_dir = os.path.join(folder_paths.get_temp_directory(), "wemm_offload")
+            os.makedirs(offload_dir, exist_ok=True)
+            load_kwargs["offload_folder"] = offload_dir
+
+        processor = AutoProcessor.from_pretrained(
+            model_source,
+            trust_remote_code=True,
+            local_files_only=local_only,
+        )
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_source,
+            **load_kwargs,
+        ).eval()
+
+        for module in model.modules():
+            if hasattr(module, "_old_forward") and not hasattr(module, "_hf_hook"):
+                module.forward = module._old_forward
+
+        _ACTIVE_SLOT["spec"] = spec
+        _ACTIVE_SLOT["model"] = model
+        _ACTIVE_SLOT["processor"] = processor
+        return model, processor
 
 
 def _video_to_data_uri(video: Input.Video) -> str:
@@ -105,13 +239,18 @@ class WeMMVideoModelLoader(io.ComfyNode):
         return io.Schema(
             node_id="WeMMVideoModelLoader",
             display_name="WeMM Video Model Loader",
-            category="WeMM",
-            description="Loads a WeMM-Video model and processor.",
+            category="video/WeMM",
+            description="Loads a WeMM-Video model from HuggingFace or a local directory.",
             inputs=[
                 io.String.Input(
                     "model_id",
                     default="tencent/WeMM-Video-9B-AWQ",
-                    tooltip="HuggingFace model ID or folder name under models/LLM.",
+                    tooltip="HuggingFace model ID or folder name under models/LLM (used when local_path is empty).",
+                ),
+                io.String.Input(
+                    "local_path",
+                    default="",
+                    tooltip="Optional local directory path of an already downloaded model (skips downloading).",
                 ),
                 io.String.Input(
                     "max_memory",
@@ -128,76 +267,13 @@ class WeMMVideoModelLoader(io.ComfyNode):
     def execute(
         cls,
         model_id: str,
+        local_path: str,
         max_memory: str,
     ) -> io.NodeOutput:
-        model_source = _resolve_model_source(model_id)
-        config = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
-
-        spec = max_memory.strip()
-        if spec.lower() in _DIRECT_DEVICE_MAPS or spec.lower().startswith("cuda"):
-            device_map: str | dict | None = spec
-        else:
-            max_mem_map = _parse_max_memory(spec)
-            if max_mem_map is not None:
-                with init_empty_weights():
-                    empty_model = AutoModelForImageTextToText.from_config(
-                        config,
-                        trust_remote_code=True,
-                        torch_dtype=torch.bfloat16,
-                    )
-                no_split = getattr(empty_model, "_no_split_modules", None)
-                device_map = infer_auto_device_map(
-                    empty_model,
-                    max_memory=max_mem_map,
-                    no_split_module_classes=no_split,
-                    dtype=torch.bfloat16,
-                    verbose=False,
-                )
-            else:
-                device_map = "auto" if torch.cuda.is_available() else None
-
-        load_kwargs: dict = {
-            "trust_remote_code": True,
-            "dtype": torch.bfloat16,
-            "config": config,
-            "device_map": device_map,
-        }
-
-        quant_cfg = getattr(config, "quantization_config", None)
-        quant_method = (
-            quant_cfg.get("quant_method")
-            if isinstance(quant_cfg, dict)
-            else getattr(quant_cfg, "quant_method", None)
-        )
-        if quant_method == "compressed-tensors":
-            if isinstance(quant_cfg, dict) and "config_groups" in quant_cfg:
-                for group in quant_cfg["config_groups"].values():
-                    group["targets"] = _AWQ_MLP_TARGETS
-            load_kwargs["quantization_config"] = CompressedTensorsConfig(
-                run_compressed=False
-            )
-
-        if device_map == "auto" or (
-            isinstance(device_map, dict) and "disk" in device_map.values()
-        ):
-            offload_dir = os.path.join(folder_paths.get_temp_directory(), "wemm_offload")
-            os.makedirs(offload_dir, exist_ok=True)
-            load_kwargs["offload_folder"] = offload_dir
-
-        processor = AutoProcessor.from_pretrained(
-            model_source,
-            trust_remote_code=True,
-        )
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_source,
-            **load_kwargs,
-        ).eval()
-
-        for module in model.modules():
-            if hasattr(module, "_old_forward") and not hasattr(module, "_hf_hook"):
-                module.forward = module._old_forward
-
-        return io.NodeOutput((model, processor))
+        model_source, local_only = _resolve_model_source(model_id, local_path)
+        spec = (model_source, local_only, max_memory.strip())
+        _ensure_loaded(spec)
+        return io.NodeOutput(spec)
 
 
 class WeMMVideoInference(io.ComfyNode):
@@ -206,7 +282,7 @@ class WeMMVideoInference(io.ComfyNode):
         return io.Schema(
             node_id="WeMMVideoInference",
             display_name="WeMM Video Inference",
-            category="WeMM",
+            category="video/WeMM",
             description="Runs WeMM-Video multimodal inference on video, images, and text.",
             inputs=[
                 WEMM_MODEL.Input("model"),
@@ -233,7 +309,7 @@ class WeMMVideoInference(io.ComfyNode):
     @classmethod
     def execute(
         cls,
-        model: tuple,
+        model: tuple[str, bool, str],
         prompt: str,
         fps: float,
         min_frames: int,
@@ -247,7 +323,7 @@ class WeMMVideoInference(io.ComfyNode):
     ) -> io.NodeOutput:
         comfy.model_management.throw_exception_if_processing_interrupted()
 
-        loaded_model, processor = model
+        loaded_model, processor = _ensure_loaded(model)
         content: list[dict] = []
 
         if video is not None:
