@@ -239,7 +239,7 @@ class WeMMVideoModelLoader(io.ComfyNode):
         return io.Schema(
             node_id="WeMMVideoModelLoader",
             display_name="WeMM Video Model Loader",
-            category="video/WeMM",
+            category="WeMM",
             description="Loads a WeMM-Video model from HuggingFace or a local directory.",
             inputs=[
                 io.String.Input(
@@ -282,7 +282,7 @@ class WeMMVideoInference(io.ComfyNode):
         return io.Schema(
             node_id="WeMMVideoInference",
             display_name="WeMM Video Inference",
-            category="video/WeMM",
+            category="WeMM",
             description="Runs WeMM-Video multimodal inference on video, images, and text.",
             inputs=[
                 WEMM_MODEL.Input("model"),

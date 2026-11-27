@@ -2,6 +2,7 @@ from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 
 from .nodes import WeMMVideoInference, WeMMVideoModelLoader
+from .nodes import ShellCommandNode, RestartSignal, DataInspector, ModelDownloaderNode
 
 
 class WeMMVideoExtension(ComfyExtension):
@@ -10,6 +11,10 @@ class WeMMVideoExtension(ComfyExtension):
         return [
             WeMMVideoModelLoader,
             WeMMVideoInference,
+            RestartSignal,
+            ShellCommandNode,
+            DataInspector,
+            ModelDownloaderNode,
         ]
 
 
