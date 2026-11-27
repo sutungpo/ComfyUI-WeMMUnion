@@ -106,7 +106,18 @@ def _unload_active_model() -> None:
 
     gc.collect()
     comfy.model_management.unload_all_models()
-    comfy.model_management.soft_empty_cache()
+    if torch.cuda.is_available():
+        for dev in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(dev)
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        usage = ", ".join(
+            f"cuda:{i}={torch.cuda.memory_allocated(i) / (1024**3):.2f}GiB"
+            for i in range(torch.cuda.device_count())
+        )
+        logger.info(f"[WeMM] VRAM after unload: {usage}")
+    else:
+        comfy.model_management.soft_empty_cache()
 
 
 def _ensure_loaded(spec: tuple[str, bool, str]) -> tuple[object, object]:
