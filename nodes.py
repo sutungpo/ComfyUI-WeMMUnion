@@ -18,6 +18,7 @@ from PIL import Image
 import urllib.parse
 
 from accelerate import infer_auto_device_map, init_empty_weights
+from accelerate.utils import get_balanced_memory
 from transformers import (
     AutoConfig,
     AutoModelForImageTextToText,
@@ -41,7 +42,7 @@ _AWQ_MLP_TARGETS = [
     r"(?:gate|up|down)_proj$"
 ]
 
-_DIRECT_DEVICE_MAPS = {"auto", "balanced", "balanced_low_0", "sequential"}
+_DIRECT_DEVICE_MAPS = {"auto", "balanced_low_0", "sequential"}
 
 _SLOT_LOCK = threading.Lock()
 _ACTIVE_SLOT: dict[str, object] = {
@@ -130,6 +131,7 @@ def _ensure_loaded(spec: tuple[str, bool, str]) -> tuple[object, object]:
             return _ACTIVE_SLOT["model"], _ACTIVE_SLOT["processor"]
 
         _unload_active_model()
+        os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 
         model_source, local_only, max_memory_spec = spec
         config = AutoConfig.from_pretrained(
@@ -138,14 +140,19 @@ def _ensure_loaded(spec: tuple[str, bool, str]) -> tuple[object, object]:
             local_files_only=local_only,
         )
 
+        is_balanced = (
+            max_memory_spec.lower() == "balanced" and torch.cuda.is_available()
+        )
         if (
             max_memory_spec.lower() in _DIRECT_DEVICE_MAPS
             or max_memory_spec.lower().startswith("cuda")
         ):
             device_map: str | dict | None = max_memory_spec
         else:
-            max_mem_map = _parse_max_memory(max_memory_spec)
-            if max_mem_map is not None:
+            max_mem_map = (
+                None if is_balanced else _parse_max_memory(max_memory_spec)
+            )
+            if is_balanced or max_mem_map is not None:
                 with init_empty_weights():
                     empty_model = AutoModelForImageTextToText.from_config(
                         config,
@@ -153,6 +160,12 @@ def _ensure_loaded(spec: tuple[str, bool, str]) -> tuple[object, object]:
                         torch_dtype=torch.bfloat16,
                     )
                 no_split = getattr(empty_model, "_no_split_modules", None)
+                if is_balanced:
+                    max_mem_map = get_balanced_memory(
+                        empty_model,
+                        no_split_module_classes=no_split,
+                        dtype=torch.bfloat16,
+                    )
                 device_map = infer_auto_device_map(
                     empty_model,
                     max_memory=max_mem_map,
@@ -162,7 +175,7 @@ def _ensure_loaded(spec: tuple[str, bool, str]) -> tuple[object, object]:
                 )
             else:
                 device_map = "auto" if torch.cuda.is_available() else None
-        logger.info(f"[WeMM] Device map: {device_map}")
+
         load_kwargs: dict = {
             "trust_remote_code": True,
             "local_files_only": local_only,
@@ -201,6 +214,13 @@ def _ensure_loaded(spec: tuple[str, bool, str]) -> tuple[object, object]:
             model_source,
             **load_kwargs,
         ).eval()
+
+        wemm_mod = sys.modules.get(model.__class__.__module__)
+        cache_cls = getattr(wemm_mod, "Qwen3_5DynamicCache", None)
+        if cache_cls is not None and not hasattr(cache_cls, "get_query_offset"):
+            cache_cls.get_query_offset = (
+                lambda self, layer_idx=0: self.get_seq_length(layer_idx)
+            )
 
         for module in model.modules():
             if hasattr(module, "_old_forward") and not hasattr(module, "_hf_hook"):
@@ -265,8 +285,8 @@ class WeMMVideoModelLoader(io.ComfyNode):
                 ),
                 io.String.Input(
                     "max_memory",
-                    default="13GiB",
-                    tooltip="Per-GPU budget ('13GiB', '13GiB,13GiB', JSON dict) or 'auto' / 'cuda:0'.",
+                    default="balanced",
+                    tooltip="Per-GPU budget ('13GiB', '8GiB,8GiB', JSON dict) or 'balanced' / 'auto' / 'cuda:0'.",
                 ),
             ],
             outputs=[
@@ -388,7 +408,6 @@ class WeMMVideoInference(io.ComfyNode):
             comfy.model_management.soft_empty_cache()
 
         return io.NodeOutput(answer)
-
 ########################################################
 # ShellCommandNode
 ########################################################
